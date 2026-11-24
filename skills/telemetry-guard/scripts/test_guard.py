@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Behavioral tests in disposable private settings; never read live settings."""
-import json, os, subprocess, sys, tempfile, unittest
+import argparse, codecs, json, os, subprocess, sys, tempfile, unittest
 from pathlib import Path
 from unittest.mock import patch
 import guard
@@ -20,6 +20,11 @@ class Behavior(unittest.TestCase):
   p=self.root/'settings.json'; p.write_text(json.dumps({'unrelated':SECRET,**({'telemetry.telemetryLevel':'all'} if app=='vscode' else {'telemetry':{'enabled':True,'salt':SECRET}})})); return p
  def plan(self,app,p,folder='change'):
   self.runcli('plan','--app',app,'--settings',p,'--out',self.root/folder); return self.root/folder/'transaction.json'
+ def host_report(self,out):
+  # HOME isolation alone does not isolate AppKit's list of real GUI applications.
+  inventory={'observed_at':'fixture','status':'available','apps':[]}
+  with patch.object(Path,'home',return_value=self.root), patch.object(guard,'running_apps',return_value=inventory):
+   return guard.report(argparse.Namespace(app='host',settings=None,out=out))
  def test_plan_projects_exact_control_and_values(self):
   for app,control,prior,proposed in [('vscode','telemetry.telemetryLevel','all','off'),('nextjs','telemetry.enabled',True,False)]:
    with self.subTest(app=app):
@@ -46,7 +51,7 @@ class Behavior(unittest.TestCase):
     self.assertIn(coverage[0],page)
     self.assertNotIn(other,page)
   out=self.root/'host'
-  self.runcli('audit','--app','host','--out',out)
+  self.host_report(out)
   coverage=json.loads((out/'summary.json').read_text())['coverage']
   self.assertEqual(len(coverage),3 if sys.platform=='darwin' else 2)
   self.assertTrue(all('guided review required' in description for description in coverage))
@@ -135,7 +140,64 @@ class Behavior(unittest.TestCase):
   self.runcli('apply','--transaction',tx,'--authorized'); t=json.loads(tx.read_text()); t['state']='applying'; tx.write_text(json.dumps(t))
   self.runcli('undo','--transaction',tx,'--authorized'); self.assertEqual(json.loads(p.read_text()),before)
  def test_survey_no_writes_and_unknowns(self):
-  out=self.root/'survey'; self.runcli('audit','--out',out)
+  out=self.root/'survey'; self.host_report(out)
   rows=json.loads((out/'summary.json').read_text())['findings']; self.assertEqual(len(rows),3 if sys.platform=='darwin' else 2); self.assertTrue(all(r['status']=='unknown' for r in rows))
   self.assertFalse((self.root/'.config').exists())
+ def test_scalar_edit_preserves_unrelated_bytes_permissions_and_attributes(self):
+  source='{\r\n "extra": [1.234567890123456789, 1e400, "enabled", {"enabled":false}],\r\n "telemetry":{"salt":"☁","enabled" : true}\r\n}\r\n'
+  for i,(mark,charset) in enumerate(((b'','utf-8'),(codecs.BOM_UTF16_BE,'utf-16-be'))):
+   with self.subTest(charset=charset):
+    p=self.root/'storage.json'; original=mark+source.encode(charset); p.write_bytes(original); p.chmod(0o640)
+    if sys.platform=='darwin':
+     subprocess.run(['/usr/bin/xattr','-w','org.example.synthetic','fixture',str(p)],check=True)
+    elif sys.platform.startswith('linux'):
+     os.setxattr(p,'user.telemetry_guard_fixture',b'fixture')
+    tx=self.plan('nextjs',p,'encoding'+str(i))
+    self.runcli('apply','--transaction',tx,'--authorized')
+    self.assertEqual(p.read_bytes(),mark+source.replace(' : true',' : false').encode(charset))
+    self.runcli('undo','--transaction',tx,'--authorized')
+    self.assertEqual(p.read_bytes(),original)
+    self.assertEqual(p.stat().st_mode&0o777,0o640)
+    if sys.platform=='darwin':
+     self.assertEqual(subprocess.check_output(['/usr/bin/xattr','-p','org.example.synthetic',str(p)]).strip(),b'fixture')
+    elif sys.platform.startswith('linux'):
+     self.assertEqual(os.getxattr(p,'user.telemetry_guard_fixture'),b'fixture')
+ def test_journal_recovers_undo_after_settings_write(self):
+  p=self.setting('vscode'); original=p.read_bytes(); tx=self.plan('vscode',p)
+  self.runcli('apply','--transaction',tx,'--authorized')
+  args=argparse.Namespace(command='undo',transaction=tx,authorized=True)
+  real_write=guard.write
+  def interrupted_write(path,b,**kwargs):
+   if path==tx and json.loads(b)['state']=='undone': raise OSError('simulated interruption')
+   return real_write(path,b,**kwargs)
+  with patch.object(guard,'write',side_effect=interrupted_write), self.assertRaises(OSError):
+   guard.transaction(args)
+  self.assertEqual(p.read_bytes(),original)
+  self.assertEqual(json.loads(tx.read_bytes())['state'],'undoing')
+  self.assertTrue(self.runcli('undo','--transaction',tx,'--authorized')['setting_verified'])
+  self.assertEqual(json.loads(tx.read_bytes())['state'],'undone')
+ def test_special_files_preexisting_outputs_and_hardlinks(self):
+  p=self.setting('vscode'); original=p.read_bytes()
+  out=self.root/'existing'; out.mkdir(mode=0o700); (out/'summary.html').write_bytes(b'existing')
+  self.runcli('audit','--app','vscode','--settings',p,'--out',out,ok=False)
+  self.assertEqual((out/'summary.html').read_bytes(),b'existing'); self.assertFalse((out/'summary.json').exists())
+  fifo=self.root/'pipe'; os.mkfifo(fifo)
+  self.assertEqual(self.runcli('plan','--app','vscode','--settings',fifo,'--out',self.root/'change',ok=False)['reason'],'unsupported_file')
+  tx=self.plan('vscode',p); os.link(p,self.root/'second-name')
+  self.assertEqual(self.runcli('plan','--app','vscode','--settings',p,'--out',self.root/'other-change',ok=False)['reason'],'unsupported_settings_metadata')
+  self.runcli('apply','--transaction',tx,'--authorized',ok=False)
+  self.assertEqual(p.read_bytes(),original); self.assertEqual(p.stat().st_nlink,2)
+ def test_terminated_process_releases_lock(self):
+  p=self.setting('vscode'); tx=self.plan('vscode',p)
+  program="import os,sys; from pathlib import Path; import guard; hold=guard.lock(Path(sys.argv[1])); hold.__enter__(); os._exit(0)"
+  subprocess.run([sys.executable,'-B','-c',program,str(p)],cwd=GUARD.parent,env=self.env,check=True)
+  self.assertTrue(self.runcli('apply','--transaction',tx,'--authorized')['setting_verified'])
+ def test_strict_json_and_tampered_version(self):
+  p=self.setting('vscode')
+  p.write_text('{"telemetry.telemetryLevel":"all","unrelated":NaN}')
+  self.plan_failure(p)
+  p=self.setting('vscode'); original=p.read_bytes(); tx=self.plan('vscode',p)
+  journal=json.loads(tx.read_bytes()); journal['version']=2; tx.write_text(json.dumps(journal))
+  self.assertEqual(self.runcli('apply','--transaction',tx,'--authorized',ok=False)['reason'],'invalid_transaction')
+  self.assertEqual(p.read_bytes(),original)
 if __name__=='__main__': unittest.main()

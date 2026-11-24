@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Offline allowlisted settings audit and optimistic reversible edits. Stdlib only."""
-import argparse, contextlib, hashlib, html, json, os, platform, stat, subprocess, sys, tempfile
+import argparse, codecs, contextlib, hashlib, html, json, os, platform, re, stat, subprocess, sys, tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -25,15 +25,17 @@ def read(path):
  for q in (p,*p.parents):
   if q.is_symlink(): fail('symlink_refused')
  try:
-  with p.open('rb') as f:
+  if not stat.S_ISREG(p.lstat().st_mode): fail('unsupported_file')
+  with open(p,'rb',opener=lambda name, flags: os.open(name, flags | getattr(os,'O_NOFOLLOW',0) | getattr(os,'O_NONBLOCK',0))) as f:
    s=os.fstat(f.fileno())
    if not stat.S_ISREG(s.st_mode) or s.st_size>2*1024*1024: fail('unsupported_file')
    if hasattr(os,'getuid') and s.st_uid!=os.getuid(): fail('owner_mismatch')
    b=f.read(2*1024*1024+1)
+   if len(b)>2*1024*1024: fail('unsupported_file')
  except FileNotFoundError: fail('settings_missing')
  except PermissionError: fail('settings_unreadable')
- try: d=json.loads(b,object_pairs_hook=pairs)
- except (ValueError,UnicodeError): fail('non_strict_json_guided_only')
+ try: d=json.loads(b,object_pairs_hook=pairs,parse_constant=lambda _: fail('non_strict_json_guided_only'))
+ except (ValueError,UnicodeError,RecursionError): fail('non_strict_json_guided_only')
  if not isinstance(d,dict): fail('unsupported_schema')
  return b,d
 
@@ -49,13 +51,36 @@ def known(app,d):
  if exists and not any(type(v)==type(x) and v==x for x in s['valid']): fail('unknown_control_value')
  return exists,v
 
-def setkey(d,keys,exists,v):
- for k in keys[:-1]:
-  if k not in d: d[k]={}
-  if not isinstance(d[k],dict): fail('unsupported_schema')
-  d=d[k]
- if exists: d[keys[-1]]=v
- else: d.pop(keys[-1],None)
+def edit_control(raw, keys, value):
+ """Replace one validated scalar token without round-tripping unrelated JSON."""
+ prefix = b''
+ for mark, encoding in ((codecs.BOM_UTF32_BE,'utf-32-be'),(codecs.BOM_UTF32_LE,'utf-32-le'),
+                        (codecs.BOM_UTF16_BE,'utf-16-be'),(codecs.BOM_UTF16_LE,'utf-16-le'),
+                        (codecs.BOM_UTF8,'utf-8')):
+  if raw.startswith(mark):
+   prefix = mark
+   break
+ else:
+  encoding = json.detect_encoding(raw)
+ text = raw[len(prefix):].decode(encoding)
+ space = re.compile(r'[ \t\r\n]*').match
+ decode = json.JSONDecoder().raw_decode
+ pos = space(text,0).end()
+ for wanted in keys:
+  pos = space(text,pos+1).end()  # validated object opening brace
+  while True:
+   key, end = decode(text,pos)
+   colon = space(text,end).end()
+   start = space(text,colon+1).end()
+   if key == wanted:
+    pos = start
+    break
+   _, end = decode(text,start)
+   comma = space(text,end).end()
+   if text[comma] != ',': fail('unsupported_schema')
+   pos = space(text,comma+1).end()
+ _, end = decode(text,pos)
+ return prefix + (text[:pos] + json.dumps(value) + text[end:]).encode(encoding)
 
 def private_dir(path):
  if os.name=='nt': fail('windows_acl_guided_only')
@@ -67,14 +92,39 @@ def private_dir(path):
  if hasattr(os,'getuid') and (s.st_uid!=os.getuid() or s.st_mode & 0o077): fail('private_directory_required')
  return p
 
-def write(path,b,exclusive=False):
+def check_settings_metadata(info):
+ if info.st_nlink!=1 or not info.st_mode & stat.S_IWUSR or info.st_mode & 0o7000:
+  fail('unsupported_settings_metadata')
+
+def preserve_settings_metadata(source, destination_fd):
+ info=os.fstat(source.fileno())
+ check_settings_metadata(info)
+ if info.st_gid!=os.fstat(destination_fd).st_gid: os.fchown(destination_fd,-1,info.st_gid)
+ if sys.platform=='darwin':
+  import ctypes
+  # macOS copyfile.h: ACL | STAT | XATTR, without copying file data.
+  libc=ctypes.CDLL(None,use_errno=True)
+  if libc.fcopyfile(source.fileno(),destination_fd,None,0x7)!=0: fail('unsupported_settings_metadata')
+ elif sys.platform.startswith('linux'):
+  for key in os.listxattr(source.fileno()):
+   os.setxattr(destination_fd,key,os.getxattr(source.fileno(),key))
+ else: fail('unsupported_settings_metadata')
+ os.fchmod(destination_fd,stat.S_IMODE(info.st_mode))
+
+def write(path,b,exclusive=False,settings=False):
  p=Path(path)
  if p.is_symlink(): fail('symlink_refused')
  if exclusive and p.exists(): fail('output_exists')
  fd,tmp=tempfile.mkstemp(prefix='.telemetry-guard-',dir=p.parent)
  try:
   os.fchmod(fd,0o600)
-  with os.fdopen(fd,'wb') as f: f.write(b); f.flush(); os.fsync(f.fileno())
+  with os.fdopen(fd,'wb') as f:
+   f.write(b)
+   f.flush()
+   if settings:
+    with open(p,'r+b',opener=lambda name, flags: os.open(name,flags | os.O_NOFOLLOW | os.O_NONBLOCK)) as source:
+     preserve_settings_metadata(source,fd)
+   os.fsync(fd)
   if exclusive:
    os.link(tmp,p); os.unlink(tmp)
   else: os.replace(tmp,p)
@@ -84,11 +134,15 @@ def write(path,b,exclusive=False):
 def enc(d): return (json.dumps(d,indent=2,ensure_ascii=True)+'\n').encode()
 @contextlib.contextmanager
 def lock(p):
- name=p.parent/('.'+p.name+'.telemetry-guard.lock')
- try: fd=os.open(name,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)
- except FileExistsError: fail('busy_no_retry')
- try: yield
- finally: os.close(fd); name.unlink()
+ import fcntl
+ if any(q.is_symlink() for q in (p,*p.parents)): fail('symlink_refused')
+ if (p.parent/('.'+p.name+'.telemetry-guard.lock')).exists(): fail('busy_no_retry')
+ fd=os.open(p.parent,os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+ try:
+  try: fcntl.flock(fd,fcntl.LOCK_EX | fcntl.LOCK_NB)
+  except BlockingIOError: fail('busy_no_retry')
+  yield
+ finally: os.close(fd)
 
 def default_path(app):
  h=Path.home(); system=platform.system()
@@ -210,7 +264,9 @@ def inventory_html(inventory,rows):
  return content
 
 def report(args):
+ if args.app=='host' and args.settings: fail('invalid_arguments')
  out=private_dir(args.out)
+ if any(os.path.lexists(out/name) for name in ('summary.json','summary.html')): fail('output_exists')
  apps=list(SCHEMAS) if args.app=='host' else [args.app]
  rows=[finding(a,Path(args.settings).absolute() if args.settings and len(apps)==1 else default_path(a)) for a in apps]
  if args.app=='host' and platform.system()=='Darwin': rows.append(chrome_finding())
@@ -227,20 +283,27 @@ def report(args):
  if args.app=='host':
   d['scope']='Open Mac apps and supported local telemetry settings at the time of this audit.'
   d['running_apps']=running_apps()
- write(out/'summary.json',enc(d),True)
  body='<html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src \'none\'; style-src \'unsafe-inline\'"><title>Telemetry guard</title><style>body{font:16px system-ui;max-width:850px;margin:3rem auto;padding:1rem}td,th{padding:.6rem;text-align:left;border-bottom:1px solid #ccc}</style></head><body><h1>Local telemetry settings audit</h1><p>'+html.escape(d['scope'])+'</p>'
  if 'running_apps' in d: body+=inventory_html(d['running_apps'],rows)
  body+='<h2>Local settings checks</h2><p>These checks look for supported controls even when the product is closed.</p><table><tr><th>Product</th><th>Finding</th></tr>'
  for r in rows: body+='<tr><td>'+html.escape(PRODUCT_NAMES[r['product']])+'</td><td>'+html.escape(status_text(r))+'</td></tr>'
  body+='</table><h2>Coverage and limits</h2><ul>'+''.join('<li>'+html.escape(x)+'</li>' for x in d['coverage']+d['limitations'])+'</ul></body></html>'
- write(out/'summary.html',body.encode(),True)
+ with lock(out/'summary.json'):
+  if any(os.path.lexists(out/name) for name in ('summary.json','summary.html')): fail('output_exists')
+  write(out/'summary.json',enc(d),True)
+  try: write(out/'summary.html',body.encode(),True)
+  except Exception:
+   (out/'summary.json').unlink()
+   raise
  return {'result':'report_written','products':len(rows),'settings_mutated':False}
 
 def plan(args):
- out=private_dir(args.out); p=Path(args.settings).absolute()
+ p=Path(args.settings).absolute()
  b,d=read(p); exists,v=known(args.app,d)
  if not exists: fail('explicit_control_required_use_guided_default_review')
  if v==SCHEMAS[args.app]['off']: fail('already_off')
+ check_settings_metadata(p.lstat())
+ out=private_dir(args.out)
  tx={'version':1,'app':args.app,'target':str(p),'before_hash':digest(b),'prior_exists':exists,'prior':v,'state':'planned'}
  write(out/'transaction.json',enc(tx),True)
  schema=SCHEMAS[args.app]
@@ -249,30 +312,39 @@ def plan(args):
          'requires':'product/version and setting-location evidence, closed writer, authorization'}
 
 def transaction(args):
- path=Path(args.transaction).absolute(); private_dir(path.parent)
+ if not args.authorized: fail('authorization_required')
+ path=Path(args.transaction).absolute()
+ if not path.parent.is_dir(): fail('settings_missing')
+ private_dir(path.parent)
  _,tx=read(path)
- if set(tx)-{'version','app','target','before_hash','prior_exists','prior','state','after_hash'}: fail('invalid_transaction')
+ if set(tx)-{'version','app','target','before_hash','prior_exists','prior','state','after_hash','undo_hash'}: fail('invalid_transaction')
+ if type(tx.get('version')) is not int or tx['version']!=1 or tx.get('prior_exists') is not True: fail('invalid_transaction')
  app=tx['app']; s=SCHEMAS[app]; p=Path(tx['target'])
  known(app, {s['keys'][0]:tx['prior']} if len(s['keys'])==1 else {s['keys'][0]:{s['keys'][1]:tx['prior']}})
- if not args.authorized: fail('authorization_required')
  with lock(p):
-  b,d=read(p); known(app,d)
+  b,d=read(p); exists,current=known(app,d)
+  check_settings_metadata(p.lstat())
   if args.command=='apply':
    if tx['state']!='planned': fail('invalid_transaction_state')
    if digest(b)!=tx['before_hash']: fail('conflict_no_write')
-   setkey(d,s['keys'],True,s['off']); new=enc(d)
+   if not exists or current!=tx['prior'] or current==s['off']: fail('invalid_transaction')
+   new=edit_control(b,s['keys'],s['off'])
    # Journal desired hash before changing settings: interrupted write can be recovered.
    tx['after_hash']=digest(new); tx['state']='applying'; write(path,enc(tx))
    if read(p)[0]!=b: fail('conflict_no_write')
-   write(p,new); tx['state']='applied'; write(path,enc(tx))
+   write(p,new,settings=True); tx['state']='applied'; write(path,enc(tx))
   else:
-   if tx['state'] not in ('applied','applying'): fail('invalid_transaction_state')
+   if tx['state'] not in ('applied','applying','undoing'): fail('invalid_transaction_state')
    if digest(b)==tx['before_hash'] and tx['state']=='applying':
     tx['state']='undone'; write(path,enc(tx)); return {'result':'unchanged_recovered'}
+   if tx['state']=='undoing' and digest(b)==tx.get('undo_hash') and exists and current==tx['prior']:
+    tx['state']='undone'; write(path,enc(tx)); return {'result':'undone','product':app,'setting_verified':True,'network_silence_proven':False}
    if digest(b)!=tx['after_hash']: fail('conflict_no_write')
-   setkey(d,s['keys'],tx['prior_exists'],tx['prior']); new=enc(d)
+   if not exists or current!=s['off']: fail('invalid_transaction')
+   new=edit_control(b,s['keys'],tx['prior'])
+   tx['undo_hash']=digest(new); tx['state']='undoing'; write(path,enc(tx))
    if read(p)[0]!=b: fail('conflict_no_write')
-   write(p,new); tx['state']='undone'; write(path,enc(tx))
+   write(p,new,settings=True); tx['state']='undone'; write(path,enc(tx))
   _,check=read(p); exists,v=known(app,check)
   expected=s['off'] if args.command=='apply' else tx['prior']
   if not exists or type(v)!=type(expected) or v!=expected: fail('verification_failed')
