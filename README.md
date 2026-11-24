@@ -39,10 +39,10 @@ The helper has no HTTP client, packet capture or background service. Its output 
 
 ## Install
 
-Clone using a GitHub account with access. From the repository root, choose the skills directory for your client. The commands leave an existing skill directory or link alone.
+Clone the public repository and choose the skills directory for your client. The commands leave an existing skill directory or link alone.
 
 ```sh
-gh repo clone walidboulanouar/telemetry-guard
+git clone https://github.com/walidboulanouar/telemetry-guard.git
 cd telemetry-guard
 
 skills_dir="$HOME/.codex/skills"        # Codex
@@ -103,3 +103,7 @@ These images reproduce the full publicly served X post views, rendered offline w
 ### Theo on his personal analytics export
 
 [![Theo’s post announcing an export of his own events.](media/theo-personal-analytics-export.png)](https://x.com/theo/status/2125332535358222808)
+
+## License
+
+The [MIT License](LICENSE) covers the first-party source code and documentation. Media files, third-party posts, screenshots, quoted material, names, logos, and trademarks retain their respective rights and fall outside this license grant.
