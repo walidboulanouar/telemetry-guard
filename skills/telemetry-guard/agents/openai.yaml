@@ -1,0 +1,3 @@
+interface:
+  display_name: "Telemetry Guard"
+  short_description: "Audit optional telemetry and private service exposure"
